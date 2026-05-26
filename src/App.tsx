@@ -307,6 +307,7 @@ function PDFPageView({
   return (
     <div
       className={`multipage-page ${active ? "active" : ""}`}
+      data-page={pageNum}
       onMouseEnter={() => onActivate(pageNum)}
       onClick={() => onActivate(pageNum)}
     >
@@ -507,7 +508,7 @@ function App() {
   const [isOcrRunning, setIsOcrRunning] = useState(false);
   const [ocrText, setOcrText] = useState<string>("");
   const [showOcrResult, setShowOcrResult] = useState(false);
-  const [viewMode, setViewMode] = useState<"single" | "two-page" | "continuous">("single");
+  const [viewMode, setViewMode] = useState<"single" | "two-page" | "continuous">("continuous");
   const [isFullScreen, setIsFullScreen] = useState(false);
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const [savedPositions, setSavedPositions] = useState<SavedPosition[]>([]);
@@ -2879,6 +2880,15 @@ function App() {
       // Save position
       if (pdf.filePath) {
         savePosition(pdf.filePath, page, pdf.zoom);
+      }
+      // Scroll to page in continuous view
+      if (viewMode === "continuous" || viewMode === "two-page") {
+        setTimeout(() => {
+          const pageElement = document.querySelector(`[data-page="${page}"]`);
+          if (pageElement) {
+            pageElement.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
+        }, 50);
       }
     }
   };
