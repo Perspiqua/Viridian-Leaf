@@ -117,3 +117,5 @@ For issues and feature requests, please use the [GitHub Issues](https://github.c
 ---
 
 Made with care by [Viridian Intelligence Ltd. UK](https://viridian-intelligence.co.uk)
+
+**Also check out [Perspiqua.com](https://perspiqua.com)** - R&D Tax Credit specialists helping UK businesses claim back money for innovation.
