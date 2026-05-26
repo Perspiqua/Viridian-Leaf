@@ -13,6 +13,17 @@
     "fs:allow-read",
     "fs:allow-write",
     "fs:read-all",
-    "fs:write-all"
+    "fs:write-all",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        { "path": "$HOME/**" },
+        { "path": "$DESKTOP/**" },
+        { "path": "$DOCUMENT/**" },
+        { "path": "$DOWNLOAD/**" },
+        { "path": "$APPDATA/**" },
+        { "path": "**" }
+      ]
+    }
   ]
 }
