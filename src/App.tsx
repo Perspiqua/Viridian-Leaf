@@ -34,6 +34,15 @@ import {
   mdiArrowDown,
 } from "@mdi/js";
 import "./App.css";
+import {
+  appendStrokePoint,
+  createFreehandStroke,
+  highlightRectToPdfRect,
+  parseHexRgb,
+  requiresSinglePageOverlay,
+  stickyNoteOverlayPosition,
+  stickyNoteToPdfRect,
+} from "./annotationUtils";
 
 // Use local worker file
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -516,6 +525,12 @@ function App() {
   const [mergeFiles, setMergeFiles] = useState<string[]>([]);
   const [draggedMergeIndex, setDraggedMergeIndex] = useState<number | null>(null);
 
+  useEffect(() => {
+    if (viewMode !== "single" && requiresSinglePageOverlay(currentTool)) {
+      setViewMode("single");
+    }
+  }, [currentTool, viewMode]);
+
   // Sidebar mode: thumbnails, bookmarks, annotations
   const [sidebarMode, setSidebarMode] = useState<"thumbnails" | "bookmarks" | "annotations">("thumbnails");
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -530,6 +545,7 @@ function App() {
   const [drawColor, setDrawColor] = useState("#000000");
   const [drawWidth, setDrawWidth] = useState(2);
   const [currentStroke, setCurrentStroke] = useState<{ x: number; y: number }[]>([]);
+  const currentStrokeRef = useRef<{ x: number; y: number }[]>([]);
 
   // Text-to-Speech
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -2118,25 +2134,26 @@ function App() {
   // Freehand drawing functions
   const startDrawing = (x: number, y: number) => {
     pushToHistory();
-    setCurrentStroke([{ x, y }]);
+    const nextStroke = [{ x, y }];
+    currentStrokeRef.current = nextStroke;
+    setCurrentStroke(nextStroke);
     setIsDrawing(true);
   };
 
   const continueDrawing = (x: number, y: number) => {
     if (!isDrawing) return;
-    setCurrentStroke(prev => [...prev, { x, y }]);
+    const nextStroke = appendStrokePoint(currentStrokeRef.current, { x, y });
+    currentStrokeRef.current = nextStroke;
+    setCurrentStroke(nextStroke);
   };
 
   const finishDrawing = () => {
-    if (currentStroke.length > 1) {
-      const newStroke: FreehandStroke = {
-        points: currentStroke,
-        color: drawColor,
-        width: drawWidth,
-        page: pdf.currentPage,
-      };
+    const stroke = currentStrokeRef.current;
+    const newStroke = createFreehandStroke(stroke, drawColor, drawWidth, pdf.currentPage);
+    if (newStroke) {
       updateCurrentTab({ freehandStrokes: [...freehandStrokes, newStroke] });
     }
+    currentStrokeRef.current = [];
     setCurrentStroke([]);
     setIsDrawing(false);
   };
@@ -2581,6 +2598,88 @@ function App() {
             width: redaction.width / scale * (pageWidth / (canvasRef.current?.width || 1) * scale),
             height: redaction.height / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
             color: rgb(0, 0, 0),
+          });
+        }
+
+        // Add highlights
+        for (const highlight of highlights) {
+          const page = pages[highlight.page - 1];
+          if (!page) continue;
+
+          const { height: pageHeight } = page.getSize();
+          const [r, g, b] = parseHexRgb(highlight.color);
+
+          for (const rect of highlight.rects) {
+            const pdfRect = highlightRectToPdfRect(rect, pageHeight, pdf.zoom);
+            page.drawRectangle({
+              x: pdfRect.x,
+              y: pdfRect.y,
+              width: pdfRect.width,
+              height: pdfRect.height,
+              color: rgb(r, g, b),
+              opacity: 0.35,
+            });
+          }
+        }
+
+        // Add freehand drawings
+        for (const stroke of freehandStrokes) {
+          const page = pages[stroke.page - 1];
+          if (!page || stroke.points.length < 2) continue;
+
+          const { height: pageHeight } = page.getSize();
+          const [r, g, b] = parseHexRgb(stroke.color);
+          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
+
+          for (let i = 1; i < stroke.points.length; i += 1) {
+            const start = stroke.points[i - 1];
+            const end = stroke.points[i];
+            page.drawLine({
+              start: { x: start.x / scale, y: pageHeight - start.y / scale },
+              end: { x: end.x / scale, y: pageHeight - end.y / scale },
+              thickness: stroke.width / (pdf.zoom * 1.5),
+              color: rgb(r, g, b),
+            });
+          }
+        }
+
+        // Add sticky notes
+        for (const note of stickyNotes) {
+          const page = pages[note.page - 1];
+          if (!page) continue;
+
+          const { height: pageHeight } = page.getSize();
+          const [r, g, b] = parseHexRgb(note.color);
+          const cssScale = pdf.zoom * 1.5;
+          const noteRect = stickyNoteToPdfRect(note, pageHeight, pdf.zoom, window.devicePixelRatio);
+
+          page.drawRectangle({
+            x: noteRect.x,
+            y: noteRect.y,
+            width: noteRect.width,
+            height: noteRect.height,
+            color: rgb(r, g, b),
+            opacity: 0.9,
+            borderColor: rgb(0.75, 0.65, 0.25),
+            borderWidth: 1,
+          });
+
+          const lines = note.text.split(/\r?\n/).flatMap(line => {
+            const chunks: string[] = [];
+            for (let i = 0; i < line.length; i += 28) {
+              chunks.push(line.slice(i, i + 28));
+            }
+            return chunks.length ? chunks : [""];
+          }).slice(0, 5);
+
+          lines.forEach((line, index) => {
+            if (!line) return;
+            page.drawText(line, {
+              x: noteRect.x + 8 / cssScale,
+              y: noteRect.y + noteRect.height - 18 / cssScale - index * (14 / cssScale),
+              size: 10,
+              color: rgb(0, 0, 0),
+            });
           });
         }
 
@@ -3709,9 +3808,12 @@ function App() {
                   else if (currentTool === "draw") handleDrawMouseUp();
                 }}
                 onMouseLeave={() => {
-                  setIsDrawing(false);
-                  setDrawStart(null);
-                  if (currentTool === "draw") handleDrawMouseUp();
+                  if (currentTool === "redact") {
+                    setIsDrawing(false);
+                    setDrawStart(null);
+                  } else if (currentTool === "draw") {
+                    handleDrawMouseUp();
+                  }
                 }}
                 onClick={handleCanvasClick}
                 style={{
@@ -3795,14 +3897,14 @@ function App() {
               {stickyNotes
                 .filter(n => n.page === pdf.currentPage)
                 .map(note => {
-                  const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
+                  const position = stickyNoteOverlayPosition(note, window.devicePixelRatio);
                   return (
                     <div
                       key={note.id}
                       className={`sticky-note ${note.isOpen ? '' : 'sticky-note-collapsed'}`}
                       style={{
-                        left: `${note.x / scale}px`,
-                        top: `${note.y / scale}px`,
+                        left: `${position.x}px`,
+                        top: `${position.y}px`,
                         '--note-color': note.color,
                       } as React.CSSProperties}
                     >
