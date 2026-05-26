@@ -4,6 +4,8 @@ A free, open-source PDF viewer and editor for Windows.
 
 **No bloatware. No subscriptions. No ads. Just PDFs.**
 
+![Viridian Leaf Screenshot](docs/screenshot.png)
+
 Built with [Tauri](https://tauri.app) + [React](https://react.dev) + [PDF.js](https://mozilla.github.io/pdf.js/)
 
 Developed by **Viridian Intelligence Ltd. UK**
