@@ -7,13 +7,20 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as pdfjsLib from "pdfjs-dist";
-import { PDFDocument, rgb, degrees } from "pdf-lib";
+import { PDFDocument, rgb, degrees, PDFName, PDFString } from "pdf-lib";
 import { createWorker } from "tesseract.js";
 import { open, save, message } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { readFile, writeFile, mkdir, readDir, remove, exists } from "@tauri-apps/plugin-fs";
 import { appDataDir, join } from "@tauri-apps/api/path";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  extractPdfContent,
+  convertToWord,
+  convertToPowerPoint,
+  extractTablesToExcel,
+} from "./conversionUtils";
 import Icon from "@mdi/react";
 import {
   mdiFileDocumentOutline,
@@ -32,22 +39,174 @@ import {
   mdiFitToScreen,
   mdiArrowUp,
   mdiArrowDown,
+  mdiRobot,
+  mdiSend,
+  mdiLink,
+  mdiCog,
 } from "@mdi/js";
 import "./App.css";
 import {
   appendStrokePoint,
   createFreehandStroke,
-  highlightRectToPdfRect,
   parseHexRgb,
   requiresSinglePageOverlay,
-  stickyNoteOverlayPosition,
-  stickyNoteToPdfRect,
 } from "./annotationUtils";
 
-// Use local worker file
-pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+// Use PDF.js worker from unpkg CDN (matches pdfjs-dist version)
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@5.7.284/build/pdf.worker.min.mjs";
 
 const clonePdfBytes = (bytes: Uint8Array) => new Uint8Array(bytes);
+const PAGE_RENDER_SCALE = 1.5;
+const STICKY_NOTE_WIDTH = 160 / PAGE_RENDER_SCALE;
+const STICKY_NOTE_HEIGHT = 90 / PAGE_RENDER_SCALE;
+
+const stripPdfExtension = (filename: string) => filename.replace(/\.pdf$/i, "");
+
+const escapeHtml = (value: string) =>
+  value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+const escapeRtf = (value: string) =>
+  value
+    .replace(/\\/g, "\\\\")
+    .replace(/{/g, "\\{")
+    .replace(/}/g, "\\}");
+
+type AiSettings = {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  useLocalFallback: boolean;
+  localBaseUrl: string;
+  localModel: string;
+};
+
+type AiProviderMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
+type ActiveAiProvider = {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  isLocal: boolean;
+};
+
+const AI_SETTINGS_STORAGE_KEY = "viridian-ai-settings";
+const DEFAULT_AI_SETTINGS: AiSettings = {
+  baseUrl: "https://api.openai.com/v1",
+  model: "gpt-4o-mini",
+  apiKey: "",
+  useLocalFallback: true,
+  localBaseUrl: "http://localhost:11434/v1",
+  localModel: "",
+};
+
+const MAX_AI_DOCUMENT_CHARS = 50000;
+
+const trimForAiContext = (text: string) => {
+  if (text.length <= MAX_AI_DOCUMENT_CHARS) return text;
+  return `${text.slice(0, MAX_AI_DOCUMENT_CHARS)}\n\n[Document text truncated to fit the AI context window.]`;
+};
+
+const AI_STOP_WORDS = new Set([
+  "about",
+  "after",
+  "again",
+  "also",
+  "because",
+  "could",
+  "does",
+  "from",
+  "have",
+  "into",
+  "that",
+  "their",
+  "there",
+  "this",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "with",
+  "would",
+]);
+
+const getAiSearchTerms = (query: string) =>
+  Array.from(new Set(
+    query
+      .toLowerCase()
+      .replace(/[^a-z0-9\s'-]/g, " ")
+      .split(/\s+/)
+      .map(term => term.replace(/^['-]+|['-]+$/g, ""))
+      .filter(term => term.length > 2 && !AI_STOP_WORDS.has(term))
+  ));
+
+const buildFocusedAiContext = (documentText: string, userMessage: string) => {
+  const lines = documentText
+    .split(/\n+/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  const searchTerms = getAiSearchTerms(userMessage);
+
+  if (searchTerms.length === 0 || lines.length === 0) {
+    return trimForAiContext(documentText);
+  }
+
+  const scoredLines = lines
+    .map((line, index) => {
+      const lowerLine = line.toLowerCase();
+      const score = searchTerms.reduce(
+        (total, term) => total + (lowerLine.includes(term) ? term.length : 0),
+        0
+      );
+      return { index, score };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+
+  if (scoredLines.length === 0) {
+    return trimForAiContext(documentText);
+  }
+
+  const included = new Set<number>();
+  const snippets = scoredLines.map(({ index }) => {
+    const start = Math.max(0, index - 2);
+    const end = Math.min(lines.length, index + 3);
+    const snippetLines: string[] = [];
+    for (let i = start; i < end; i++) {
+      if (!included.has(i)) {
+        included.add(i);
+        snippetLines.push(lines[i]);
+      }
+    }
+    return snippetLines.join("\n");
+  }).filter(Boolean);
+
+  return [
+    "Most relevant extracted PDF lines:",
+    snippets.join("\n---\n"),
+    "",
+    "Full extracted PDF text:",
+    trimForAiContext(documentText),
+  ].join("\n");
+};
+
+const chooseLocalChatModel = (models: string[]) => {
+  const chatModels = models.filter(model => !/(embed|embedding|ocr)/i.test(model));
+  return (
+    chatModels.find(model => /(^|:)(e?4b|1b|2b|3b|7b|8b)([-_:]|$)/i.test(model)) ??
+    chatModels[0] ??
+    models[0] ??
+    ""
+  );
+};
 
 const hasPdfHeader = (bytes: Uint8Array | null) => {
   try {
@@ -517,6 +676,11 @@ function App() {
   const [isOcrRunning, setIsOcrRunning] = useState(false);
   const [ocrText, setOcrText] = useState<string>("");
   const [showOcrResult, setShowOcrResult] = useState(false);
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [aiProgress, setAiProgress] = useState("");
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [summaryText, setSummaryText] = useState("");
+  const [isConverting, setIsConverting] = useState(false);
   const [viewMode, setViewMode] = useState<"single" | "two-page" | "continuous">("continuous");
   const [isFullScreen, setIsFullScreen] = useState(false);
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
@@ -531,9 +695,27 @@ function App() {
     }
   }, [currentTool, viewMode]);
 
-  // Sidebar mode: thumbnails, bookmarks, annotations
+  // Sidebar mode: thumbnails, bookmarks, annotations (AI moved to right panel)
   const [sidebarMode, setSidebarMode] = useState<"thumbnails" | "bookmarks" | "annotations">("thumbnails");
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+
+  // AI Chat
+  const [aiChatMessages, setAiChatMessages] = useState<{role: "user" | "assistant", content: string}[]>([]);
+  const [aiChatInput, setAiChatInput] = useState("");
+  const [showAiSettings, setShowAiSettings] = useState(false);
+  const [aiSettings, setAiSettings] = useState<AiSettings>(() => {
+    try {
+      const stored = localStorage.getItem(AI_SETTINGS_STORAGE_KEY);
+      return stored ? { ...DEFAULT_AI_SETTINGS, ...JSON.parse(stored) } : DEFAULT_AI_SETTINGS;
+    } catch {
+      return DEFAULT_AI_SETTINGS;
+    }
+  });
+  const [aiSettingsDraft, setAiSettingsDraft] = useState<AiSettings>(aiSettings);
+  const [localAiModels, setLocalAiModels] = useState<string[]>([]);
+  const [localAiModelsError, setLocalAiModelsError] = useState("");
+  const [isLoadingLocalAiModels, setIsLoadingLocalAiModels] = useState(false);
 
   // Highlight color
   const [highlightColor, setHighlightColor] = useState("#ffff00");
@@ -590,7 +772,7 @@ function App() {
 
   // Link creation
   const [pendingLinkRect, setPendingLinkRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
-  const [_showLinkModal, setShowLinkModal] = useState(false);
+  const [showLinkModal, setShowLinkModal] = useState(false);
   const [newLinkUrl, setNewLinkUrl] = useState("");
 
   // Image insertion
@@ -628,6 +810,216 @@ function App() {
     }
 
     throw new Error("Current PDF data is unavailable. Reopen the PDF and try again.");
+  };
+
+  const getDisplayScale = () => pdf.zoom * PAGE_RENDER_SCALE;
+  const getCanvasScale = () => getDisplayScale() * window.devicePixelRatio;
+
+  const getOverlayPdfPoint = (e: React.MouseEvent) => {
+    if (!overlayCanvasRef.current) return null;
+
+    const rect = overlayCanvasRef.current.getBoundingClientRect();
+    const displayScale = getDisplayScale();
+    return {
+      x: (e.clientX - rect.left) / displayScale,
+      y: (e.clientY - rect.top) / displayScale,
+    };
+  };
+
+  const toPdfLibRect = (rect: { x: number; y: number; width: number; height: number }, pageHeight: number) => ({
+    x: rect.x,
+    y: pageHeight - rect.y - rect.height,
+    width: rect.width,
+    height: rect.height,
+  });
+
+  const loadImageElement = (src: string) =>
+    new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+
+  const normalizeImageForPdf = async (dataUrl: string) => {
+    const img = await loadImageElement(dataUrl);
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Unable to prepare image for PDF export.");
+    ctx.drawImage(img, 0, 0);
+    return canvas.toDataURL("image/png");
+  };
+
+  const drawWrappedCanvasText = (
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    x: number,
+    y: number,
+    maxWidth: number,
+    lineHeight: number,
+    maxLines: number,
+  ) => {
+    const lines = text.split(/\r?\n/).flatMap((line) => {
+      const words = line.split(/\s+/);
+      const wrapped: string[] = [];
+      let current = "";
+
+      for (const word of words) {
+        const next = current ? `${current} ${word}` : word;
+        if (ctx.measureText(next).width <= maxWidth || !current) {
+          current = next;
+        } else {
+          wrapped.push(current);
+          current = word;
+        }
+      }
+
+      if (current) wrapped.push(current);
+      return wrapped.length ? wrapped : [""];
+    }).slice(0, maxLines);
+
+    lines.forEach((line, index) => {
+      if (line) ctx.fillText(line, x, y + index * lineHeight);
+    });
+  };
+
+  const drawAnnotationsOnCanvas = async (
+    ctx: CanvasRenderingContext2D,
+    pageNum: number,
+    exportScale: number,
+  ) => {
+    const scaleRect = (rect: { x: number; y: number; width: number; height: number }) => ({
+      x: rect.x * exportScale,
+      y: rect.y * exportScale,
+      width: rect.width * exportScale,
+      height: rect.height * exportScale,
+    });
+
+    for (const highlight of highlights.filter(h => h.page === pageNum)) {
+      const [r, g, b] = parseHexRgb(highlight.color);
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;
+      highlight.rects.forEach((rect) => {
+        const scaled = scaleRect(rect);
+        ctx.fillRect(scaled.x, scaled.y, scaled.width, scaled.height);
+      });
+      ctx.restore();
+    }
+
+    for (const img of imageAnnotations.filter(img => img.page === pageNum)) {
+      const image = await loadImageElement(img.dataUrl);
+      const scaled = scaleRect(img);
+      ctx.drawImage(image, scaled.x, scaled.y, scaled.width, scaled.height);
+    }
+
+    for (const sig of signatures.filter(sig => sig.page === pageNum)) {
+      const image = await loadImageElement(sig.dataUrl);
+      const scaled = scaleRect(sig);
+      ctx.drawImage(image, scaled.x, scaled.y, scaled.width, scaled.height);
+    }
+
+    for (const ann of textAnnotations.filter(ann => ann.page === pageNum && ann.text)) {
+      ctx.save();
+      ctx.fillStyle = "#000";
+      ctx.font = `${ann.fontSize * exportScale}px sans-serif`;
+      ctx.textBaseline = "top";
+      ctx.fillText(ann.text, ann.x * exportScale, ann.y * exportScale);
+      ctx.restore();
+    }
+
+    for (const stroke of freehandStrokes.filter(stroke => stroke.page === pageNum && stroke.points.length >= 2)) {
+      const [r, g, b] = parseHexRgb(stroke.color);
+      ctx.save();
+      ctx.strokeStyle = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;
+      ctx.lineWidth = Math.max(1, stroke.width * exportScale);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(stroke.points[0].x * exportScale, stroke.points[0].y * exportScale);
+      for (let i = 1; i < stroke.points.length; i += 1) {
+        ctx.lineTo(stroke.points[i].x * exportScale, stroke.points[i].y * exportScale);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    for (const note of stickyNotes.filter(note => note.page === pageNum)) {
+      const [r, g, b] = parseHexRgb(note.color);
+      const noteRect = {
+        x: note.x * exportScale,
+        y: note.y * exportScale,
+        width: STICKY_NOTE_WIDTH * exportScale,
+        height: STICKY_NOTE_HEIGHT * exportScale,
+      };
+
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;
+      ctx.strokeStyle = "rgb(191, 166, 64)";
+      ctx.lineWidth = Math.max(1, exportScale);
+      ctx.fillRect(noteRect.x, noteRect.y, noteRect.width, noteRect.height);
+      ctx.strokeRect(noteRect.x, noteRect.y, noteRect.width, noteRect.height);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#000";
+      ctx.font = `${10 * exportScale}px sans-serif`;
+      ctx.textBaseline = "top";
+      drawWrappedCanvasText(
+        ctx,
+        note.text,
+        noteRect.x + 8 * exportScale,
+        noteRect.y + 10 * exportScale,
+        noteRect.width - 16 * exportScale,
+        14 * exportScale,
+        5,
+      );
+      ctx.restore();
+    }
+
+    for (const link of linkAnnotations.filter(link => link.page === pageNum)) {
+      const scaled = scaleRect(link);
+      ctx.save();
+      ctx.strokeStyle = "#0a7e5c";
+      ctx.fillStyle = "rgba(10, 126, 92, 0.12)";
+      ctx.lineWidth = Math.max(1, exportScale);
+      ctx.setLineDash([4 * exportScale, 3 * exportScale]);
+      ctx.fillRect(scaled.x, scaled.y, scaled.width, scaled.height);
+      ctx.strokeRect(scaled.x, scaled.y, scaled.width, scaled.height);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.fillStyle = "#000";
+    redactions
+      .filter(r => r.page === pageNum)
+      .forEach((rect) => {
+        const scaled = scaleRect(rect);
+        ctx.fillRect(scaled.x, scaled.y, scaled.width, scaled.height);
+      });
+    ctx.restore();
+  };
+
+  const addUriLinkAnnotation = (
+    pdfDoc: PDFDocument,
+    page: any,
+    link: LinkAnnotation,
+    pageHeight: number,
+  ) => {
+    const rect = toPdfLibRect(link, pageHeight);
+    const annotation = pdfDoc.context.obj({
+      Type: PDFName.of("Annot"),
+      Subtype: PDFName.of("Link"),
+      Rect: [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height],
+      Border: [0, 0, 0],
+      A: {
+        Type: PDFName.of("Action"),
+        S: PDFName.of("URI"),
+        URI: PDFString.of(link.url),
+      },
+    });
+    page.node.addAnnot(pdfDoc.context.register(annotation));
   };
 
   // Create new tab
@@ -866,7 +1258,7 @@ function App() {
       const context = canvas.getContext("2d");
       if (!context) return;
 
-      const scale = zoomLevel * 1.5 * window.devicePixelRatio;
+        const scale = zoomLevel * PAGE_RENDER_SCALE * window.devicePixelRatio;
       const viewport = page.getViewport({ scale });
 
       canvas.width = viewport.width;
@@ -952,11 +1344,12 @@ function App() {
 
     const pageRedactions = redactions.filter(r => r.page === pdf.currentPage);
     ctx.fillStyle = "rgba(0, 0, 0, 1)";
+    const scale = getCanvasScale();
 
     pageRedactions.forEach(rect => {
-      ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+      ctx.fillRect(rect.x * scale, rect.y * scale, rect.width * scale, rect.height * scale);
     });
-  }, [redactions, pdf.currentPage]);
+  }, [redactions, pdf.currentPage, pdf.zoom]);
 
   useEffect(() => {
     if (viewMode === "single" && !isLoading && pdf.doc && canvasRef.current) {
@@ -968,7 +1361,7 @@ function App() {
           const context = canvas.getContext("2d");
           if (!context) return;
 
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
+          const scale = getCanvasScale();
           const viewport = page.getViewport({ scale });
 
           canvas.width = viewport.width;
@@ -1164,9 +1557,10 @@ function App() {
 
     try {
       const ext = format === "jpeg" ? "jpg" : "png";
+      const baseName = pdf.fileName ? stripPdfExtension(pdf.fileName) : "document";
       const savePath = await save({
         filters: [{ name: `${format.toUpperCase()} Image`, extensions: [ext] }],
-        defaultPath: `${pdf.fileName?.replace(".pdf", "")}_page${pdf.currentPage}.${ext}`,
+        defaultPath: `${baseName}_page${pdf.currentPage}.${ext}`,
       });
 
       if (savePath) {
@@ -1187,18 +1581,7 @@ function App() {
           canvas: canvas,
         }).promise;
 
-        // Apply redactions
-        const pageRedactions = redactions.filter(r => r.page === pdf.currentPage);
-        context.fillStyle = "black";
-        pageRedactions.forEach(rect => {
-          const scaleFactor = scale / (pdf.zoom * 1.5 * window.devicePixelRatio);
-          context.fillRect(
-            rect.x * scaleFactor,
-            rect.y * scaleFactor,
-            rect.width * scaleFactor,
-            rect.height * scaleFactor
-          );
-        });
+        await drawAnnotationsOnCanvas(context, pdf.currentPage, scale);
 
         const dataUrl = canvas.toDataURL(`image/${format}`, 0.95);
         const base64Data = dataUrl.split(",")[1];
@@ -1226,7 +1609,7 @@ function App() {
 
       if (folder) {
         const ext = format === "jpeg" ? "jpg" : "png";
-        const baseName = pdf.fileName?.replace(".pdf", "") || "page";
+        const baseName = pdf.fileName ? stripPdfExtension(pdf.fileName) : "page";
 
         for (let i = 1; i <= pdf.totalPages; i++) {
           const page = await pdf.doc.getPage(i);
@@ -1246,18 +1629,7 @@ function App() {
             canvas: canvas,
           }).promise;
 
-          // Apply redactions
-          const pageRedactions = redactions.filter(r => r.page === i);
-          context.fillStyle = "black";
-          pageRedactions.forEach(rect => {
-            const scaleFactor = scale / (pdf.zoom * 1.5 * window.devicePixelRatio);
-            context.fillRect(
-              rect.x * scaleFactor,
-              rect.y * scaleFactor,
-              rect.width * scaleFactor,
-              rect.height * scaleFactor
-            );
-          });
+          await drawAnnotationsOnCanvas(context, i, scale);
 
           const dataUrl = canvas.toDataURL(`image/${format}`, 0.95);
           const base64Data = dataUrl.split(",")[1];
@@ -1354,6 +1726,324 @@ function App() {
       }
     } catch (err) {
       console.error("Error adding files:", err);
+    }
+  };
+
+  // Convert to Word
+  const exportToWord = async () => {
+    if (!pdf.doc) return;
+    setActiveMenu(null);
+    setIsConverting(true);
+
+    try {
+      const content = await extractPdfContent(pdf.doc);
+      const wordBuffer = await convertToWord(content, pdf.fileName || "document.pdf");
+
+      const savePath = await save({
+        filters: [{ name: "Word Document", extensions: ["docx"] }],
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}.docx` : "document.docx",
+      });
+
+      if (savePath) {
+        await writeFile(savePath, wordBuffer);
+        await message(`Exported to ${savePath}`, { title: "Export Complete" });
+      }
+    } catch (err) {
+      console.error("Error exporting to Word:", err);
+      await message(`Export failed: ${err}`, { title: "Error", kind: "error" });
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
+  // Convert to PowerPoint
+  const exportToPowerPoint = async () => {
+    if (!pdf.doc) return;
+    setActiveMenu(null);
+    setIsConverting(true);
+
+    try {
+      const content = await extractPdfContent(pdf.doc);
+      const pptBuffer = await convertToPowerPoint(content, pdf.fileName || "document.pdf");
+
+      const savePath = await save({
+        filters: [{ name: "PowerPoint", extensions: ["pptx"] }],
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}.pptx` : "document.pptx",
+      });
+
+      if (savePath) {
+        await writeFile(savePath, pptBuffer);
+        await message(`Exported to ${savePath}`, { title: "Export Complete" });
+      }
+    } catch (err) {
+      console.error("Error exporting to PowerPoint:", err);
+      await message(`Export failed: ${err}`, { title: "Error", kind: "error" });
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
+  // Extract tables to Excel
+  const exportTablesToExcel = async () => {
+    if (!pdf.doc) return;
+    setActiveMenu(null);
+    setIsConverting(true);
+
+    try {
+      const excelBuffer = await extractTablesToExcel(
+        pdf.doc,
+        pdf.fileName || "document.pdf"
+      );
+
+      const savePath = await save({
+        filters: [{ name: "Excel", extensions: ["xlsx"] }],
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}_tables.xlsx` : "document_tables.xlsx",
+      });
+
+      if (savePath) {
+        await writeFile(savePath, excelBuffer);
+        await message(`Extracted tables to ${savePath}`, { title: "Export Complete" });
+      }
+    } catch (err) {
+      console.error("Error extracting tables:", err);
+      await message(`Export failed: ${err}`, { title: "Error", kind: "error" });
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
+  const hasHostedAiProviderSettings = () =>
+    aiSettings.baseUrl.trim().length > 0 &&
+    aiSettings.model.trim().length > 0 &&
+    aiSettings.apiKey.trim().length > 0;
+
+  const hasLocalAiProviderSettings = () =>
+    aiSettings.useLocalFallback &&
+    aiSettings.localBaseUrl.trim().length > 0;
+
+  const hasAiProviderSettings = () =>
+    hasHostedAiProviderSettings() || hasLocalAiProviderSettings();
+
+  const refreshLocalAiModels = async (
+    baseUrl = aiSettingsDraft.localBaseUrl,
+    updateDraft = true
+  ) => {
+    const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "") || DEFAULT_AI_SETTINGS.localBaseUrl;
+    setIsLoadingLocalAiModels(true);
+    setLocalAiModelsError("");
+    try {
+      const models = await invoke<string[]>("ai_list_local_models", { baseUrl: normalizedBaseUrl });
+      setLocalAiModels(models);
+      const chosenModel = chooseLocalChatModel(models);
+
+      if (updateDraft && chosenModel) {
+        setAiSettingsDraft(prev => {
+          const currentModel = prev.localModel.trim();
+          if (currentModel && models.includes(currentModel)) return prev;
+          return { ...prev, localBaseUrl: normalizedBaseUrl, localModel: chosenModel };
+        });
+      }
+
+      return models;
+    } catch (err) {
+      const errorMessage = String(err);
+      setLocalAiModels([]);
+      setLocalAiModelsError(errorMessage);
+      throw err;
+    } finally {
+      setIsLoadingLocalAiModels(false);
+    }
+  };
+
+  const openAiSettings = () => {
+    setAiSettingsDraft(aiSettings);
+    setShowAiSettings(true);
+    setLocalAiModelsError("");
+    if (aiSettings.useLocalFallback && aiSettings.localBaseUrl.trim()) {
+      void refreshLocalAiModels(aiSettings.localBaseUrl, true).catch(() => undefined);
+    }
+  };
+
+  const persistAiSettings = (nextSettings: AiSettings) => {
+    setAiSettings(nextSettings);
+    setAiSettingsDraft(nextSettings);
+    localStorage.setItem(AI_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
+  };
+
+  const getActiveAiProvider = (): ActiveAiProvider | null => {
+    if (hasHostedAiProviderSettings()) {
+      return {
+        baseUrl: aiSettings.baseUrl,
+        model: aiSettings.model,
+        apiKey: aiSettings.apiKey,
+        isLocal: false,
+      };
+    }
+    if (hasLocalAiProviderSettings()) {
+      return {
+        baseUrl: aiSettings.localBaseUrl,
+        model: aiSettings.localModel,
+        apiKey: "",
+        isLocal: true,
+      };
+    }
+    return null;
+  };
+
+  const saveAiSettings = () => {
+    const localModel = aiSettingsDraft.localModel.trim();
+    const selectedLocalModel =
+      localModel && localAiModels.includes(localModel)
+        ? localModel
+        : chooseLocalChatModel(localAiModels) || localModel;
+    const nextSettings = {
+      baseUrl: aiSettingsDraft.baseUrl.trim().replace(/\/+$/, "") || DEFAULT_AI_SETTINGS.baseUrl,
+      model: aiSettingsDraft.model.trim(),
+      apiKey: aiSettingsDraft.apiKey.trim(),
+      useLocalFallback: aiSettingsDraft.useLocalFallback,
+      localBaseUrl: aiSettingsDraft.localBaseUrl.trim().replace(/\/+$/, "") || DEFAULT_AI_SETTINGS.localBaseUrl,
+      localModel: selectedLocalModel,
+    };
+    persistAiSettings(nextSettings);
+    setShowAiSettings(false);
+  };
+
+  const ensureLocalAiProviderModel = async (provider: ActiveAiProvider): Promise<ActiveAiProvider> => {
+    if (!provider.isLocal) return provider;
+
+    try {
+      const models = await invoke<string[]>("ai_list_local_models", { baseUrl: provider.baseUrl });
+      setLocalAiModels(models);
+
+      if (models.length === 0) {
+        throw new Error("Ollama is running, but it did not report any installed models.");
+      }
+
+      const configuredModel = provider.model.trim();
+      if (configuredModel && models.includes(configuredModel)) {
+        return { ...provider, model: configuredModel };
+      }
+
+      const model = chooseLocalChatModel(models);
+      if (!model) {
+        throw new Error("Ollama is running, but no usable local chat model was found.");
+      }
+
+      const nextSettings = { ...aiSettings, localModel: model };
+      persistAiSettings(nextSettings);
+      return { ...provider, model };
+    } catch (err) {
+      if (provider.model.trim()) return provider;
+      throw err;
+    }
+  };
+
+  const callConversationalAi = async (
+    userMessage: string,
+    documentText: string,
+    options: { mode?: "chat" | "summary"; maxTokens?: number } = {}
+  ): Promise<string> => {
+    let provider = getActiveAiProvider();
+    if (!provider) {
+      openAiSettings();
+      throw new Error("Add hosted AI settings or enable local AI fallback first.");
+    }
+    provider = await ensureLocalAiProviderModel(provider);
+
+    const contextText = options.mode === "summary"
+      ? trimForAiContext(documentText)
+      : buildFocusedAiContext(documentText, userMessage);
+    const recentHistory: AiProviderMessage[] = aiChatMessages.slice(-8).map(msg => ({
+      role: msg.role,
+      content: msg.content,
+    }));
+    const systemPrompt =
+      "You are the Viridian Leaf PDF assistant. Be conversational, clear, and useful. " +
+      "The supplied PDF text is authoritative, including table rows and cells. " +
+      "Use the most relevant extracted PDF lines first, then the full extracted text if needed. " +
+      "If a person appears in a table, use the row for that person as evidence. " +
+      "If earlier chat history conflicts with the supplied PDF text, correct yourself using the PDF text. " +
+      "Answer using the supplied PDF text. If the document does not contain enough information, say that directly. " +
+      "Do not return isolated extracted phrases unless the user explicitly asks for a quote.";
+
+    const taskPrompt = options.mode === "summary"
+      ? `Summarize this PDF for a reader. Cover the main topic, key points, and any conclusions or action items.\n\nPDF text:\n${contextText}`
+      : `PDF text:\n${contextText}\n\nUser question:\n${userMessage}`;
+
+    return await invoke<string>("ai_chat_completion", {
+      request: {
+        base_url: provider.baseUrl,
+        api_key: provider.apiKey,
+        model: provider.model,
+        temperature: 0.2,
+        max_tokens: options.maxTokens ?? 900,
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...recentHistory,
+          { role: "user", content: taskPrompt },
+        ],
+      },
+    });
+  };
+
+  // AI Summarize
+  const aiSummarize = async () => {
+    if (!pdf.doc) return;
+    setActiveMenu(null);
+    setIsAiLoading(true);
+    setAiProgress("Extracting text...");
+
+    try {
+      const content = await extractPdfContent(pdf.doc);
+
+      setAiProgress("Generating summary...");
+      const summary = await callConversationalAi("Summarize this document", content.text, {
+        mode: "summary",
+        maxTokens: 1200,
+      });
+
+      setSummaryText(summary);
+      setShowSummaryModal(true);
+    } catch (err) {
+      console.error("Error summarizing:", err);
+      await message(`Summarization failed: ${err}`, { title: "Error", kind: "error" });
+    } finally {
+      setIsAiLoading(false);
+      setAiProgress("");
+    }
+  };
+
+  // AI Chat - send message
+  const sendAiMessage = async () => {
+    if (!aiChatInput.trim() || !pdf.doc || isAiLoading) return;
+
+    const userMessage = aiChatInput.trim();
+    setAiChatInput("");
+    setAiChatMessages(prev => [...prev, { role: "user", content: userMessage }]);
+    setIsAiLoading(true);
+
+    try {
+      const content = await extractPdfContent(pdf.doc);
+
+      let response: string;
+      const lowerMessage = userMessage.toLowerCase();
+
+      if (lowerMessage.includes("how many pages") || lowerMessage === "pages") {
+        response = `This document has ${pdf.totalPages} pages.`;
+      } else {
+        response = await callConversationalAi(userMessage, content.text, {
+          mode: lowerMessage.includes("summarize") || lowerMessage.includes("summarise") || lowerMessage.includes("summary")
+            ? "summary"
+            : "chat",
+          maxTokens: 1100,
+        });
+      }
+
+      setAiChatMessages(prev => [...prev, { role: "assistant", content: response }]);
+    } catch (err) {
+      setAiChatMessages(prev => [...prev, { role: "assistant", content: `Error: ${err}` }]);
+    } finally {
+      setIsAiLoading(false);
     }
   };
 
@@ -1540,7 +2230,7 @@ function App() {
     try {
       const savePath = await save({
         filters: [{ name: "PDF", extensions: ["pdf"] }],
-        defaultPath: pdf.fileName?.replace(".pdf", "_redacted.pdf") || "redacted.pdf",
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}_redacted.pdf` : "redacted.pdf",
       });
 
       if (savePath) {
@@ -1552,19 +2242,14 @@ function App() {
           const page = pages[redaction.page - 1];
           if (!page) continue;
 
-          const { width: pageWidth, height: pageHeight } = page.getSize();
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
-
-          const x = (redaction.x / scale) * (pageWidth / (canvasRef.current?.width || 1) * scale);
-          const y = pageHeight - ((redaction.y + redaction.height) / scale) * (pageHeight / (canvasRef.current?.height || 1) * scale);
-          const w = (redaction.width / scale) * (pageWidth / (canvasRef.current?.width || 1) * scale);
-          const h = (redaction.height / scale) * (pageHeight / (canvasRef.current?.height || 1) * scale);
+          const { height: pageHeight } = page.getSize();
+          const rect = toPdfLibRect(redaction, pageHeight);
 
           page.drawRectangle({
-            x: x,
-            y: y,
-            width: w,
-            height: h,
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
             color: rgb(0, 0, 0),
           });
         }
@@ -1931,32 +2616,25 @@ function App() {
   const handleSignatureDragStart = (e: React.MouseEvent, index: number) => {
     e.stopPropagation();
     const sig = signatures[index];
-    if (!overlayCanvasRef.current) return;
-
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
 
     setDraggingSignature(index);
     setSignatureDragOffset({
-      x: (e.clientX - rect.left) * scaleX - sig.x,
-      y: (e.clientY - rect.top) * scaleY - sig.y,
+      x: point.x - sig.x,
+      y: point.y - sig.y,
     });
   };
 
   const handleSignatureDrag = (e: React.MouseEvent) => {
-    if (draggingSignature === null || !overlayCanvasRef.current) return;
+    if (draggingSignature === null) return;
 
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-
-    const newX = (e.clientX - rect.left) * scaleX - signatureDragOffset.x;
-    const newY = (e.clientY - rect.top) * scaleY - signatureDragOffset.y;
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
 
     updateCurrentTab({
       signatures: signatures.map((sig, i) =>
-        i === draggingSignature ? { ...sig, x: newX, y: newY } : sig
+        i === draggingSignature ? { ...sig, x: point.x - signatureDragOffset.x, y: point.y - signatureDragOffset.y } : sig
       )
     });
   };
@@ -1983,8 +2661,8 @@ function App() {
       const img = new Image();
       img.onload = () => {
         // Scale to reasonable size while preserving aspect ratio
-        const maxWidth = 200;
-        const maxHeight = 100;
+        const maxWidth = 200 / PAGE_RENDER_SCALE;
+        const maxHeight = 100 / PAGE_RENDER_SCALE;
         const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
         resolve({
           width: img.width * scale,
@@ -1997,25 +2675,20 @@ function App() {
 
   // Handle canvas click for placing signature or text
   const handleCanvasClick = async (e: React.MouseEvent) => {
-    if (!overlayCanvasRef.current) return;
-
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
+    const { x, y } = point;
 
     if (currentTool === "sign" && pendingSignature) {
       // Get actual signature dimensions preserving aspect ratio
       const dims = await getSignatureDimensions(pendingSignature);
-      const displayScale = pdf.zoom * 1.5 * window.devicePixelRatio;
 
       const newSignature: Signature = {
         dataUrl: pendingSignature,
-        x: x - (dims.width * displayScale) / 2,
-        y: y - (dims.height * displayScale) / 2,
-        width: dims.width * displayScale,
-        height: dims.height * displayScale,
+        x: x - dims.width / 2,
+        y: y - dims.height / 2,
+        width: dims.width,
+        height: dims.height,
         page: pdf.currentPage,
       };
       pushToHistory();
@@ -2037,32 +2710,28 @@ function App() {
       addStickyNote(x, y);
     } else if (currentTool === "image" && pendingImage) {
       placeImage(x, y);
+    } else if (currentTool === "link") {
+      setPendingLinkRect({ x, y, width: 160, height: 32 });
+      setNewLinkUrl("");
+      setShowLinkModal(true);
     }
   };
 
   // Handle drawing mouse events
   const handleDrawMouseDown = (e: React.MouseEvent) => {
-    if (currentTool !== "draw" || !overlayCanvasRef.current) return;
+    if (currentTool !== "draw") return;
 
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
-
-    startDrawing(x, y);
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
+    startDrawing(point.x, point.y);
   };
 
   const handleDrawMouseMove = (e: React.MouseEvent) => {
-    if (currentTool !== "draw" || !isDrawing || !overlayCanvasRef.current) return;
+    if (currentTool !== "draw" || !isDrawing) return;
 
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
-
-    continueDrawing(x, y);
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
+    continueDrawing(point.x, point.y);
   };
 
   const handleDrawMouseUp = () => {
@@ -2088,9 +2757,15 @@ function App() {
   // Highlight functions
   const addHighlight = (rects: { x: number; y: number; width: number; height: number }[], text: string) => {
     pushToHistory();
+    const displayScale = getDisplayScale();
     const newHighlight: Highlight = {
       id: `hl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      rects,
+      rects: rects.map(rect => ({
+        x: rect.x / displayScale,
+        y: rect.y / displayScale,
+        width: rect.width / displayScale,
+        height: rect.height / displayScale,
+      })),
       color: highlightColor,
       page: pdf.currentPage,
       text,
@@ -2149,7 +2824,7 @@ function App() {
 
   const finishDrawing = () => {
     const stroke = currentStrokeRef.current;
-    const newStroke = createFreehandStroke(stroke, drawColor, drawWidth, pdf.currentPage);
+    const newStroke = createFreehandStroke(stroke, drawColor, drawWidth / getDisplayScale(), pdf.currentPage);
     if (newStroke) {
       updateCurrentTab({ freehandStrokes: [...freehandStrokes, newStroke] });
     }
@@ -2188,16 +2863,15 @@ function App() {
     const img = new Image();
     img.onload = () => {
       pushToHistory();
-      const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
-      const maxWidth = 300;
+      const maxWidth = 300 / PAGE_RENDER_SCALE;
       const ratio = Math.min(1, maxWidth / img.width);
       const newImage: ImageAnnotation = {
         id: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         dataUrl: pendingImage,
-        x: x - (img.width * ratio * scale) / 2,
-        y: y - (img.height * ratio * scale) / 2,
-        width: img.width * ratio * scale,
-        height: img.height * ratio * scale,
+        x: x - (img.width * ratio) / 2,
+        y: y - (img.height * ratio) / 2,
+        width: img.width * ratio,
+        height: img.height * ratio,
         page: pdf.currentPage,
       };
       updateCurrentTab({ imageAnnotations: [...imageAnnotations, newImage] });
@@ -2213,7 +2887,7 @@ function App() {
   };
 
   // Link creation
-  const _createLink = () => {
+  const createLink = () => {
     if (!pendingLinkRect || !newLinkUrl.trim()) return;
 
     pushToHistory();
@@ -2543,7 +3217,7 @@ function App() {
     try {
       const savePath = await save({
         filters: [{ name: "PDF", extensions: ["pdf"] }],
-        defaultPath: pdf.fileName?.replace(".pdf", "_annotated.pdf") || "annotated.pdf",
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}_annotated.pdf` : "annotated.pdf",
       });
 
       if (savePath) {
@@ -2556,12 +3230,9 @@ function App() {
           const page = pages[ann.page - 1];
           if (!page || !ann.text) continue;
 
-          const { height: pageHeight } = page.getSize();
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
-
           page.drawText(ann.text, {
-            x: ann.x / scale * (page.getWidth() / (canvasRef.current?.width || 1) * scale),
-            y: pageHeight - ann.y / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
+            x: ann.x,
+            y: page.getHeight() - ann.y - ann.fontSize,
             size: ann.fontSize,
             color: rgb(0, 0, 0),
           });
@@ -2573,31 +3244,31 @@ function App() {
           if (!page) continue;
 
           const { height: pageHeight } = page.getSize();
-          const pngImage = await pdfDoc.embedPng(sig.dataUrl);
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
+          const pngImage = await pdfDoc.embedPng(await normalizeImageForPdf(sig.dataUrl));
+          const rect = toPdfLibRect(sig, pageHeight);
 
           page.drawImage(pngImage, {
-            x: sig.x / scale * (page.getWidth() / (canvasRef.current?.width || 1) * scale),
-            y: pageHeight - (sig.y + sig.height) / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
-            width: sig.width / scale * (page.getWidth() / (canvasRef.current?.width || 1) * scale),
-            height: sig.height / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
           });
         }
 
-        // Add redactions
-        for (const redaction of redactions) {
-          const page = pages[redaction.page - 1];
+        // Add inserted images
+        for (const imageAnnotation of imageAnnotations) {
+          const page = pages[imageAnnotation.page - 1];
           if (!page) continue;
 
-          const { width: pageWidth, height: pageHeight } = page.getSize();
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
+          const { height: pageHeight } = page.getSize();
+          const pngImage = await pdfDoc.embedPng(await normalizeImageForPdf(imageAnnotation.dataUrl));
+          const rect = toPdfLibRect(imageAnnotation, pageHeight);
 
-          page.drawRectangle({
-            x: redaction.x / scale * (pageWidth / (canvasRef.current?.width || 1) * scale),
-            y: pageHeight - (redaction.y + redaction.height) / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
-            width: redaction.width / scale * (pageWidth / (canvasRef.current?.width || 1) * scale),
-            height: redaction.height / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
-            color: rgb(0, 0, 0),
+          page.drawImage(pngImage, {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
           });
         }
 
@@ -2610,7 +3281,7 @@ function App() {
           const [r, g, b] = parseHexRgb(highlight.color);
 
           for (const rect of highlight.rects) {
-            const pdfRect = highlightRectToPdfRect(rect, pageHeight, pdf.zoom);
+            const pdfRect = toPdfLibRect(rect, pageHeight);
             page.drawRectangle({
               x: pdfRect.x,
               y: pdfRect.y,
@@ -2629,15 +3300,14 @@ function App() {
 
           const { height: pageHeight } = page.getSize();
           const [r, g, b] = parseHexRgb(stroke.color);
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
 
           for (let i = 1; i < stroke.points.length; i += 1) {
             const start = stroke.points[i - 1];
             const end = stroke.points[i];
             page.drawLine({
-              start: { x: start.x / scale, y: pageHeight - start.y / scale },
-              end: { x: end.x / scale, y: pageHeight - end.y / scale },
-              thickness: stroke.width / (pdf.zoom * 1.5),
+              start: { x: start.x, y: pageHeight - start.y },
+              end: { x: end.x, y: pageHeight - end.y },
+              thickness: stroke.width,
               color: rgb(r, g, b),
             });
           }
@@ -2650,8 +3320,10 @@ function App() {
 
           const { height: pageHeight } = page.getSize();
           const [r, g, b] = parseHexRgb(note.color);
-          const cssScale = pdf.zoom * 1.5;
-          const noteRect = stickyNoteToPdfRect(note, pageHeight, pdf.zoom, window.devicePixelRatio);
+          const noteRect = toPdfLibRect(
+            { x: note.x, y: note.y, width: STICKY_NOTE_WIDTH, height: STICKY_NOTE_HEIGHT },
+            pageHeight,
+          );
 
           page.drawRectangle({
             x: noteRect.x,
@@ -2675,11 +3347,48 @@ function App() {
           lines.forEach((line, index) => {
             if (!line) return;
             page.drawText(line, {
-              x: noteRect.x + 8 / cssScale,
-              y: noteRect.y + noteRect.height - 18 / cssScale - index * (14 / cssScale),
+              x: noteRect.x + 8,
+              y: noteRect.y + noteRect.height - 18 - index * 14,
               size: 10,
               color: rgb(0, 0, 0),
             });
+          });
+        }
+
+        // Add interactive links
+        for (const link of linkAnnotations) {
+          const page = pages[link.page - 1];
+          if (!page) continue;
+
+          const { height: pageHeight } = page.getSize();
+          const rect = toPdfLibRect(link, pageHeight);
+          page.drawRectangle({
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            color: rgb(0.04, 0.49, 0.36),
+            opacity: 0.12,
+            borderColor: rgb(0.04, 0.49, 0.36),
+            borderWidth: 1,
+          });
+          addUriLinkAnnotation(pdfDoc, page, link, pageHeight);
+        }
+
+        // Add redactions last so they remain visually opaque
+        for (const redaction of redactions) {
+          const page = pages[redaction.page - 1];
+          if (!page) continue;
+
+          const { height: pageHeight } = page.getSize();
+          const rect = toPdfLibRect(redaction, pageHeight);
+
+          page.drawRectangle({
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            color: rgb(0, 0, 0),
           });
         }
 
@@ -2701,7 +3410,7 @@ function App() {
     try {
       const savePath = await save({
         filters: [{ name: "PDF", extensions: ["pdf"] }],
-        defaultPath: pdf.fileName?.replace(".pdf", "_signed.pdf") || "signed.pdf",
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}_signed.pdf` : "signed.pdf",
       });
 
       if (savePath) {
@@ -2714,14 +3423,14 @@ function App() {
           if (!page) continue;
 
           const { height: pageHeight } = page.getSize();
-          const pngImage = await pdfDoc.embedPng(sig.dataUrl);
-          const scale = pdf.zoom * 1.5 * window.devicePixelRatio;
+          const pngImage = await pdfDoc.embedPng(await normalizeImageForPdf(sig.dataUrl));
+          const rect = toPdfLibRect(sig, pageHeight);
 
           page.drawImage(pngImage, {
-            x: sig.x / scale * (page.getWidth() / (canvasRef.current?.width || 1) * scale),
-            y: pageHeight - (sig.y + sig.height) / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
-            width: sig.width / scale * (page.getWidth() / (canvasRef.current?.width || 1) * scale),
-            height: sig.height / scale * (pageHeight / (canvasRef.current?.height || 1) * scale),
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
           });
         }
 
@@ -2756,7 +3465,7 @@ function App() {
 
       const savePath = await save({
         filters: [{ name: "PDF", extensions: ["pdf"] }],
-        defaultPath: pdf.fileName?.replace(".pdf", "_reordered.pdf") || "reordered.pdf",
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}_reordered.pdf` : "reordered.pdf",
       });
 
       if (savePath) {
@@ -2891,12 +3600,12 @@ function App() {
 
       switch (format) {
         case "rtf":
-          content = `{\\rtf1\\ansi\\deff0\n${text.replace(/\n/g, "\\par\n")}\n}`;
+          content = `{\\rtf1\\ansi\\deff0\n${escapeRtf(text).replace(/\n/g, "\\par\n")}\n}`;
           ext = "rtf";
           filterName = "Rich Text Format";
           break;
         case "html":
-          content = `<!DOCTYPE html>\n<html>\n<head><title>${pdf.fileName}</title></head>\n<body>\n<pre>${text}</pre>\n</body>\n</html>`;
+          content = `<!DOCTYPE html>\n<html>\n<head><title>${escapeHtml(pdf.fileName || "document")}</title></head>\n<body>\n<pre>${escapeHtml(text)}</pre>\n</body>\n</html>`;
           ext = "html";
           filterName = "HTML Document";
           break;
@@ -2908,7 +3617,7 @@ function App() {
 
       const savePath = await save({
         filters: [{ name: filterName, extensions: [ext] }],
-        defaultPath: pdf.fileName?.replace(".pdf", `.${ext}`) || `document.${ext}`,
+        defaultPath: pdf.fileName ? `${stripPdfExtension(pdf.fileName)}.${ext}` : `document.${ext}`,
       });
 
       if (savePath) {
@@ -3047,31 +3756,23 @@ function App() {
 
   // Redaction tool handlers
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (currentTool !== "redact" || !overlayCanvasRef.current) return;
+    if (currentTool !== "redact") return;
 
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
     setIsDrawing(true);
-    setDrawStart({
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY,
-    });
+    setDrawStart(point);
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!isDrawing || !drawStart || !overlayCanvasRef.current) return;
 
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-
-    const currentX = (e.clientX - rect.left) * scaleX;
-    const currentY = (e.clientY - rect.top) * scaleY;
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
 
     const ctx = overlayCanvasRef.current.getContext("2d");
     if (!ctx) return;
+    const scale = getCanvasScale();
 
     // Redraw existing redactions
     drawRedactions();
@@ -3079,28 +3780,24 @@ function App() {
     // Draw current selection
     ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
     ctx.fillRect(
-      Math.min(drawStart.x, currentX),
-      Math.min(drawStart.y, currentY),
-      Math.abs(currentX - drawStart.x),
-      Math.abs(currentY - drawStart.y)
+      Math.min(drawStart.x, point.x) * scale,
+      Math.min(drawStart.y, point.y) * scale,
+      Math.abs(point.x - drawStart.x) * scale,
+      Math.abs(point.y - drawStart.y) * scale
     );
   };
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!isDrawing || !drawStart || !overlayCanvasRef.current) return;
 
-    const rect = overlayCanvasRef.current.getBoundingClientRect();
-    const scaleX = overlayCanvasRef.current.width / rect.width;
-    const scaleY = overlayCanvasRef.current.height / rect.height;
-
-    const endX = (e.clientX - rect.left) * scaleX;
-    const endY = (e.clientY - rect.top) * scaleY;
+    const point = getOverlayPdfPoint(e);
+    if (!point) return;
 
     const newRedaction: RedactionRect = {
-      x: Math.min(drawStart.x, endX),
-      y: Math.min(drawStart.y, endY),
-      width: Math.abs(endX - drawStart.x),
-      height: Math.abs(endY - drawStart.y),
+      x: Math.min(drawStart.x, point.x),
+      y: Math.min(drawStart.y, point.y),
+      width: Math.abs(point.x - drawStart.x),
+      height: Math.abs(point.y - drawStart.y),
       page: pdf.currentPage,
     };
 
@@ -3348,6 +4045,8 @@ function App() {
             { label: "Export Page as Image...", action: () => exportToImage("png"), shortcut: "Ctrl+E", disabled: !pdf.doc },
             { label: "Export All Pages as Images...", action: () => exportAllPages("png"), disabled: !pdf.doc },
             { label: "Export as Text...", action: () => exportToFormat("txt"), disabled: !pdf.doc },
+            { label: "Export as RTF...", action: () => exportToFormat("rtf"), disabled: !pdf.doc },
+            { label: "Export as HTML...", action: () => exportToFormat("html"), disabled: !pdf.doc },
             { separator: true },
             { label: "Copy Page to Clipboard", action: copyToClipboard, disabled: !pdf.doc },
             { label: "Print...", action: printPDF, shortcut: "Ctrl+P", disabled: !pdf.doc },
@@ -3374,9 +4073,10 @@ function App() {
                 stickyNotes: [],
                 freehandStrokes: [],
                 imageAnnotations: [],
+                linkAnnotations: [],
               });
               setActiveMenu(null);
-            }, disabled: !pdf.doc || (redactions.length === 0 && signatures.length === 0 && textAnnotations.length === 0 && highlights.length === 0 && stickyNotes.length === 0 && freehandStrokes.length === 0 && imageAnnotations.length === 0) },
+            }, disabled: !pdf.doc || (redactions.length === 0 && signatures.length === 0 && textAnnotations.length === 0 && highlights.length === 0 && stickyNotes.length === 0 && freehandStrokes.length === 0 && imageAnnotations.length === 0 && linkAnnotations.length === 0) },
           ]}
         />
         <Menu
@@ -3385,6 +4085,7 @@ function App() {
             { label: "Text Box", action: () => { setCurrentTool("text"); setActiveMenu(null); }, disabled: !pdf.doc },
             { label: "Sticky Note", action: () => { setCurrentTool("note"); setActiveMenu(null); }, disabled: !pdf.doc },
             { label: "Image...", action: () => { loadImageForInsertion(); setActiveMenu(null); }, disabled: !pdf.doc },
+            { label: "Link Area", action: () => { setCurrentTool("link"); setActiveMenu(null); }, disabled: !pdf.doc },
             { separator: true },
             { label: "Draw Signature...", action: startSignature, disabled: !pdf.doc },
             { label: "Load Signature Image...", action: loadSignatureForCrop, disabled: !pdf.doc },
@@ -3410,6 +4111,7 @@ function App() {
             { label: "Clear Text Boxes", action: () => { pushToHistory(); updateCurrentTab({ textAnnotations: [] }); setActiveMenu(null); }, disabled: textAnnotations.length === 0 },
             { label: "Clear Signatures", action: () => { pushToHistory(); updateCurrentTab({ signatures: [] }); setActiveMenu(null); }, disabled: signatures.length === 0 },
             { label: "Clear Images", action: () => { pushToHistory(); updateCurrentTab({ imageAnnotations: [] }); setActiveMenu(null); }, disabled: imageAnnotations.length === 0 },
+            { label: "Clear Links", action: () => { pushToHistory(); updateCurrentTab({ linkAnnotations: [] }); setActiveMenu(null); }, disabled: linkAnnotations.length === 0 },
           ]}
         />
         <Menu
@@ -3420,6 +4122,13 @@ function App() {
             { separator: true },
             { label: "Extract Text (OCR)...", action: runOCR, disabled: !pdf.doc || isOcrRunning },
             { label: "Read Aloud", action: () => { toggleSpeaking(); setActiveMenu(null); }, disabled: !pdf.doc },
+            { separator: true },
+            { label: "AI Settings...", action: () => { openAiSettings(); setActiveMenu(null); } },
+            { label: "AI Summarize...", action: aiSummarize, disabled: !pdf.doc || isAiLoading },
+            { separator: true },
+            { label: "Export to Word...", action: exportToWord, disabled: !pdf.doc || isConverting },
+            { label: "Export to PowerPoint...", action: exportToPowerPoint, disabled: !pdf.doc || isConverting },
+            { label: "Extract Tables to Excel...", action: exportTablesToExcel, disabled: !pdf.doc || isConverting },
           ]}
         />
         <Menu
@@ -3479,6 +4188,8 @@ function App() {
             {currentTool === "draw" && "Draw Tool - Freehand drawing"}
             {currentTool === "text" && "Text Tool - Click to add text"}
             {currentTool === "sign" && "Sign Tool - Click to place"}
+            {currentTool === "link" && "Link Tool - Click to add a link area"}
+            {currentTool === "image" && "Image Tool - Click to place"}
             <button onClick={() => setCurrentTool("none")}><Icon path={mdiClose} size={0.6} /></button>
           </div>
         )}
@@ -3594,6 +4305,14 @@ function App() {
             title="Add Text (Form Fill)"
           >
             <Icon path={mdiFormatText} size={0.7} />
+          </button>
+          <button
+            onClick={() => setCurrentTool(currentTool === "link" ? "none" : "link")}
+            disabled={!pdf.doc}
+            className={currentTool === "link" ? "active" : ""}
+            title="Add Link Area"
+          >
+            <Icon path={mdiLink} size={0.7} />
           </button>
         </div>
 
@@ -3758,6 +4477,7 @@ function App() {
             )}
           </div>
           )}
+
         </div>
         )}
 
@@ -3819,9 +4539,10 @@ function App() {
                 style={{
                   cursor: currentTool === "redact" ? "crosshair" :
                          currentTool === "draw" ? "crosshair" :
-                         currentTool === "sign" && pendingSignature ? "copy" :
-                         currentTool === "note" ? "cell" :
-                         currentTool === "text" ? "text" : "default",
+                          currentTool === "sign" && pendingSignature ? "copy" :
+                          currentTool === "note" ? "cell" :
+                          currentTool === "text" ? "text" :
+                          currentTool === "link" ? "crosshair" : "default",
                   pointerEvents: (currentTool === "none" || currentTool === "highlight" || currentTool === "select") ? "none" : "auto"
                 }}
               />
@@ -3830,16 +4551,16 @@ function App() {
               {highlights
                 .filter(h => h.page === pdf.currentPage)
                 .map(h => {
-                  const _scale = pdf.zoom * 1.5;
+                  const scale = getDisplayScale();
                   return h.rects.map((rect, i) => (
                     <div
                       key={`${h.id}-${i}`}
                       className="highlight-overlay"
                       style={{
-                        left: `${rect.x}px`,
-                        top: `${rect.y}px`,
-                        width: `${rect.width}px`,
-                        height: `${rect.height}px`,
+                        left: `${rect.x * scale}px`,
+                        top: `${rect.y * scale}px`,
+                        width: `${rect.width * scale}px`,
+                        height: `${rect.height * scale}px`,
                         backgroundColor: h.color,
                       }}
                     />
@@ -3861,9 +4582,9 @@ function App() {
                 {freehandStrokes
                   .filter(s => s.page === pdf.currentPage)
                   .map((stroke, i) => {
-                    const dpr = window.devicePixelRatio;
+                    const scale = getDisplayScale();
                     const points = stroke.points.map(p =>
-                      `${p.x / dpr},${p.y / dpr}`
+                      `${p.x * scale},${p.y * scale}`
                     ).join(' ');
                     return (
                       <polyline
@@ -3871,7 +4592,7 @@ function App() {
                         points={points}
                         fill="none"
                         stroke={stroke.color}
-                        strokeWidth={stroke.width}
+                        strokeWidth={stroke.width * scale}
                         strokeLinecap="round"
                         strokeLinejoin="round"
                       />
@@ -3881,8 +4602,8 @@ function App() {
                 {currentTool === "draw" && currentStroke.length > 1 && (
                   <polyline
                     points={currentStroke.map(p => {
-                      const dpr = window.devicePixelRatio;
-                      return `${p.x / dpr},${p.y / dpr}`;
+                      const scale = getDisplayScale();
+                      return `${p.x * scale},${p.y * scale}`;
                     }).join(' ')}
                     fill="none"
                     stroke={drawColor}
@@ -3897,14 +4618,17 @@ function App() {
               {stickyNotes
                 .filter(n => n.page === pdf.currentPage)
                 .map(note => {
-                  const position = stickyNoteOverlayPosition(note, window.devicePixelRatio);
+                  const scale = getDisplayScale();
                   return (
                     <div
                       key={note.id}
                       className={`sticky-note ${note.isOpen ? '' : 'sticky-note-collapsed'}`}
                       style={{
-                        left: `${position.x}px`,
-                        top: `${position.y}px`,
+                        left: `${note.x * scale}px`,
+                        top: `${note.y * scale}px`,
+                        width: note.isOpen ? `${STICKY_NOTE_WIDTH * scale}px` : undefined,
+                        minWidth: note.isOpen ? `${STICKY_NOTE_WIDTH * scale}px` : undefined,
+                        height: note.isOpen ? `${STICKY_NOTE_HEIGHT * scale}px` : undefined,
                         '--note-color': note.color,
                       } as React.CSSProperties}
                     >
@@ -3934,14 +4658,14 @@ function App() {
                 .filter(ann => ann.page === pdf.currentPage)
                 .map((ann, _index) => {
                   const actualIndex = textAnnotations.findIndex(a => a === ann);
-                  const scale = pdf.zoom * 1.5;
+                  const scale = getDisplayScale();
                   return (
                     <div
                       key={`text-${actualIndex}`}
                       className="text-annotation"
                       style={{
-                        left: `${ann.x / window.devicePixelRatio / scale}px`,
-                        top: `${ann.y / window.devicePixelRatio / scale}px`,
+                        left: `${ann.x * scale}px`,
+                        top: `${ann.y * scale}px`,
                       }}
                     >
                       <input
@@ -3951,7 +4675,7 @@ function App() {
                         onFocus={() => setEditingTextIndex(actualIndex)}
                         onBlur={() => setEditingTextIndex(null)}
                         placeholder="Type here..."
-                        style={{ fontSize: `${ann.fontSize}px` }}
+                        style={{ fontSize: `${ann.fontSize * scale}px` }}
                         autoFocus={editingTextIndex === actualIndex}
                       />
                       <button
@@ -3968,16 +4692,16 @@ function App() {
                 .filter(sig => sig.page === pdf.currentPage)
                 .map((sig, _index) => {
                   const actualIndex = signatures.findIndex(s => s === sig);
-                  const scale = pdf.zoom * 1.5;
+                  const scale = getDisplayScale();
                   return (
                     <div
                       key={actualIndex}
                       className="signature-overlay"
                       style={{
-                        left: `${sig.x / window.devicePixelRatio / scale}px`,
-                        top: `${sig.y / window.devicePixelRatio / scale}px`,
-                        width: `${sig.width / window.devicePixelRatio / scale}px`,
-                        height: `${sig.height / window.devicePixelRatio / scale}px`,
+                        left: `${sig.x * scale}px`,
+                        top: `${sig.y * scale}px`,
+                        width: `${sig.width * scale}px`,
+                        height: `${sig.height * scale}px`,
                       }}
                       onMouseDown={(e) => handleSignatureDragStart(e, actualIndex)}
                     >
@@ -3995,16 +4719,16 @@ function App() {
               {imageAnnotations
                 .filter(img => img.page === pdf.currentPage)
                 .map((img) => {
-                  const scale = pdf.zoom * 1.5;
+                  const scale = getDisplayScale();
                   return (
                     <div
                       key={img.id}
                       className="image-annotation-overlay"
                       style={{
-                        left: `${img.x / window.devicePixelRatio / scale}px`,
-                        top: `${img.y / window.devicePixelRatio / scale}px`,
-                        width: `${img.width / window.devicePixelRatio / scale}px`,
-                        height: `${img.height / window.devicePixelRatio / scale}px`,
+                        left: `${img.x * scale}px`,
+                        top: `${img.y * scale}px`,
+                        width: `${img.width * scale}px`,
+                        height: `${img.height * scale}px`,
                       }}
                     >
                       <img src={img.dataUrl} alt="Inserted image" draggable={false} />
@@ -4021,16 +4745,16 @@ function App() {
               {linkAnnotations
                 .filter(link => link.page === pdf.currentPage)
                 .map((link) => {
-                  const scale = pdf.zoom * 1.5;
+                  const scale = getDisplayScale();
                   return (
                     <div
                       key={link.id}
                       className="link-annotation-overlay"
                       style={{
-                        left: `${link.x / window.devicePixelRatio / scale}px`,
-                        top: `${link.y / window.devicePixelRatio / scale}px`,
-                        width: `${link.width / window.devicePixelRatio / scale}px`,
-                        height: `${link.height / window.devicePixelRatio / scale}px`,
+                        left: `${link.x * scale}px`,
+                        top: `${link.y * scale}px`,
+                        width: `${link.width * scale}px`,
+                        height: `${link.height * scale}px`,
                       }}
                       onClick={() => window.open(link.url, "_blank")}
                       title={link.url}
@@ -4075,6 +4799,81 @@ function App() {
             </div>
           )}
         </div>
+
+        {/* AI Panel Toggle Button (Right Side) */}
+        {!isFullScreen && pdf.doc && (
+          <button
+            className="ai-panel-toggle"
+            onClick={() => setAiPanelOpen(!aiPanelOpen)}
+            title={aiPanelOpen ? "Hide AI Assistant" : "Show AI Assistant"}
+          >
+            <Icon path={mdiRobot} size={0.9} />
+            {!aiPanelOpen && <span className="ai-toggle-label">AI</span>}
+          </button>
+        )}
+
+        {/* AI Panel (Right Side) */}
+        {!isFullScreen && aiPanelOpen && (
+        <div className="ai-panel-right">
+          <div className="ai-panel-header">
+            <Icon path={mdiRobot} size={0.8} />
+            <span>AI Assistant</span>
+            <button
+              className="ai-panel-close"
+              onClick={openAiSettings}
+              title="AI Settings"
+            >
+              <Icon path={mdiCog} size={0.7} />
+            </button>
+            <button className="ai-panel-close" onClick={() => setAiPanelOpen(false)}>
+              <Icon path={mdiClose} size={0.7} />
+            </button>
+          </div>
+          <div className="ai-chat-messages">
+            {aiChatMessages.length === 0 ? (
+              <div className="ai-chat-welcome">
+                <p>{hasAiProviderSettings() ? "Ask me about this PDF!" : "Configure AI to start"}</p>
+                <p className="ai-chat-hints">
+                  {hasAiProviderSettings()
+                    ? 'Try: "Summarise this document" or ask any question about the content.'
+                    : "Click the gear icon above to add an OpenAI API key, or set up Ollama for free local AI."}
+                </p>
+              </div>
+            ) : (
+              aiChatMessages.map((msg, i) => (
+                <div key={i} className={`ai-chat-message ${msg.role}`}>
+                  {msg.role === "assistant" && <Icon path={mdiRobot} size={0.6} />}
+                  <div className="ai-chat-bubble">{msg.content}</div>
+                </div>
+              ))
+            )}
+            {isAiLoading && (
+              <div className="ai-chat-message assistant">
+                <Icon path={mdiRobot} size={0.6} />
+                <div className="ai-chat-bubble ai-typing">Thinking...</div>
+              </div>
+            )}
+          </div>
+          <div className="ai-chat-input-container">
+            <input
+              type="text"
+              className="ai-chat-input"
+              placeholder="Ask about the PDF..."
+              value={aiChatInput}
+              onChange={(e) => setAiChatInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendAiMessage()}
+              disabled={!pdf.doc || isAiLoading}
+            />
+            <button
+              className="ai-chat-send"
+              onClick={sendAiMessage}
+              disabled={!pdf.doc || isAiLoading || !aiChatInput.trim()}
+            >
+              <Icon path={mdiSend} size={0.8} />
+            </button>
+          </div>
+        </div>
+        )}
       </div>
 
       {/* Status Bar */}
@@ -4196,6 +4995,175 @@ function App() {
           <div className="modal">
             <h2>Running OCR...</h2>
             <p>Please wait while text is being extracted from the page.</p>
+          </div>
+        </div>
+      )}
+
+      {/* AI Summary Modal */}
+      {showSummaryModal && (
+        <div className="modal-overlay" onClick={() => setShowSummaryModal(false)}>
+          <div className="modal ocr-modal" onClick={(e) => e.stopPropagation()}>
+            <h2>AI Summary</h2>
+            <textarea
+              className="ocr-result"
+              value={summaryText}
+              readOnly
+              rows={10}
+            />
+            <div className="ocr-buttons">
+              <button onClick={async () => {
+                await navigator.clipboard.writeText(summaryText);
+                await message("Summary copied to clipboard", { title: "Copied" });
+              }}>Copy</button>
+              <button onClick={() => setShowSummaryModal(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Settings Modal */}
+      {showAiSettings && (
+        <div className="modal-overlay" onClick={() => setShowAiSettings(false)}>
+          <div className="modal ai-settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h2>AI Settings</h2>
+            <label className="settings-field">
+              <span>Hosted API Base URL</span>
+              <input
+                type="text"
+                value={aiSettingsDraft.baseUrl}
+                placeholder="https://api.openai.com/v1"
+                onChange={(e) => setAiSettingsDraft(prev => ({ ...prev, baseUrl: e.target.value }))}
+              />
+            </label>
+            <label className="settings-field">
+              <span>Hosted Model</span>
+              <input
+                type="text"
+                value={aiSettingsDraft.model}
+                placeholder="gpt-4o-mini"
+                onChange={(e) => setAiSettingsDraft(prev => ({ ...prev, model: e.target.value }))}
+              />
+            </label>
+            <label className="settings-field">
+              <span>Hosted API Key</span>
+              <input
+                type="password"
+                value={aiSettingsDraft.apiKey}
+                placeholder="OpenAI-compatible API key"
+                onChange={(e) => setAiSettingsDraft(prev => ({ ...prev, apiKey: e.target.value }))}
+              />
+            </label>
+            <div className="settings-section-header">Local AI (Ollama)</div>
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={aiSettingsDraft.useLocalFallback}
+                onChange={(e) => setAiSettingsDraft(prev => ({ ...prev, useLocalFallback: e.target.checked }))}
+              />
+              <span>Use local AI (Ollama) when no hosted API key is configured</span>
+            </label>
+            <label className="settings-field">
+              <span>Local API Base URL</span>
+              <input
+                type="text"
+                value={aiSettingsDraft.localBaseUrl}
+                placeholder="http://localhost:11434/v1"
+                disabled={!aiSettingsDraft.useLocalFallback}
+                onChange={(e) => setAiSettingsDraft(prev => ({ ...prev, localBaseUrl: e.target.value }))}
+              />
+            </label>
+            <div className="settings-field">
+              <div className="settings-field-header">
+                <span>Local Model</span>
+                <button
+                  type="button"
+                  className="settings-secondary-button"
+                  disabled={!aiSettingsDraft.useLocalFallback || isLoadingLocalAiModels}
+                  onClick={() => void refreshLocalAiModels(aiSettingsDraft.localBaseUrl, true).catch(() => undefined)}
+                >
+                  {isLoadingLocalAiModels ? "Loading..." : "Refresh"}
+                </button>
+              </div>
+              <input
+                type="text"
+                list="local-ai-models"
+                value={aiSettingsDraft.localModel}
+                placeholder="Auto-select from Ollama"
+                disabled={!aiSettingsDraft.useLocalFallback}
+                onChange={(e) => setAiSettingsDraft(prev => ({ ...prev, localModel: e.target.value }))}
+              />
+              <datalist id="local-ai-models">
+                {localAiModels.map(model => (
+                  <option key={model} value={model} />
+                ))}
+              </datalist>
+              {localAiModels.length > 0 && (
+                <small className="settings-hint">
+                  Installed models: {localAiModels.join(", ")}
+                </small>
+              )}
+              {localAiModelsError && (
+                <small className="settings-error">{localAiModelsError}</small>
+              )}
+            </div>
+            <details className="ollama-setup-instructions">
+              <summary>How to set up Ollama (free, local AI)</summary>
+              <div className="ollama-instructions-content">
+                {navigator.platform.toLowerCase().includes("mac") || navigator.platform.toLowerCase().includes("darwin") ? (
+                  <>
+                    <p><strong>macOS Setup:</strong></p>
+                    <ol>
+                      <li>Download Ollama from <a href="https://ollama.ai" target="_blank" rel="noopener noreferrer">ollama.ai</a></li>
+                      <li>Open the downloaded .dmg and drag Ollama to Applications</li>
+                      <li>Launch Ollama from Applications</li>
+                      <li>Open Terminal and run: <code>ollama list</code></li>
+                      <li>Enable the checkbox above and click Save</li>
+                    </ol>
+                    <p className="ollama-note">Ollama runs in the background. The menu bar icon shows it's active.</p>
+                  </>
+                ) : (
+                  <>
+                    <p><strong>Windows Setup:</strong></p>
+                    <ol>
+                      <li>Download Ollama from <a href="https://ollama.ai" target="_blank" rel="noopener noreferrer">ollama.ai</a></li>
+                      <li>Run the installer (OllamaSetup.exe)</li>
+                      <li>Open Command Prompt or PowerShell</li>
+                      <li>Run: <code>ollama list</code></li>
+                      <li>Enable the checkbox above and click Save</li>
+                    </ol>
+                    <p className="ollama-note">Ollama runs as a system service. Check the system tray for the icon.</p>
+                  </>
+                )}
+                <p className="ollama-models">
+                  <strong>Recommended models:</strong><br/>
+                  Use Refresh to select an installed model. On this machine, Gemma models such as <code>gemma4:e4b</code> or <code>gemma4:26b</code> are valid local choices.
+                </p>
+              </div>
+            </details>
+            <div className="settings-actions">
+              <button onClick={() => setAiSettingsDraft(DEFAULT_AI_SETTINGS)}>Reset</button>
+              <button onClick={() => setShowAiSettings(false)}>Cancel</button>
+              <button
+                className="primary"
+                onClick={saveAiSettings}
+                disabled={
+                  (!aiSettingsDraft.baseUrl.trim() || !aiSettingsDraft.model.trim() || !aiSettingsDraft.apiKey.trim()) &&
+                  (!aiSettingsDraft.useLocalFallback || !aiSettingsDraft.localBaseUrl.trim())
+                }
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Conversion Loading Indicator */}
+      {isConverting && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Converting...</h2>
+            <p>Please wait while the document is being converted.</p>
           </div>
         </div>
       )}
@@ -4496,6 +5464,46 @@ function App() {
         </div>
       )}
 
+      {/* Link Modal */}
+      {showLinkModal && pendingLinkRect && (
+        <div className="modal-overlay" onClick={() => setShowLinkModal(false)}>
+          <div className="modal bookmark-modal" onClick={(e) => e.stopPropagation()}>
+            <h2>Add Link</h2>
+            <p>Add a link area on page {pdf.currentPage}</p>
+            <div className="modal-form">
+              <label>
+                URL:
+                <input
+                  type="url"
+                  value={newLinkUrl}
+                  onChange={(e) => setNewLinkUrl(e.target.value)}
+                  placeholder="https://example.com"
+                  autoFocus
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") createLink();
+                    if (e.key === "Escape") {
+                      setShowLinkModal(false);
+                      setPendingLinkRect(null);
+                      setCurrentTool("none");
+                    }
+                  }}
+                />
+              </label>
+            </div>
+            <div className="modal-buttons">
+              <button onClick={() => {
+                setShowLinkModal(false);
+                setPendingLinkRect(null);
+                setCurrentTool("none");
+              }}>Cancel</button>
+              <button onClick={createLink} className="primary" disabled={!newLinkUrl.trim()}>
+                Add Link
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Signature Crop Modal */}
       {showCropModal && cropImageSrc && (
         <div className="modal-overlay" onClick={() => setShowCropModal(false)}>
@@ -4632,6 +5640,12 @@ function App() {
         <div className="tool-floating-indicator">
           Click on the document to place the image
           <button onClick={() => { setPendingImage(null); setCurrentTool("none"); }}>Cancel</button>
+        </div>
+      )}
+      {currentTool === "link" && (
+        <div className="tool-floating-indicator">
+          Click on the document to place a link area
+          <button onClick={() => { setPendingLinkRect(null); setShowLinkModal(false); setCurrentTool("none"); }}>Cancel</button>
         </div>
       )}
     </div>

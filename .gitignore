@@ -31,3 +31,7 @@ src-tauri/Cargo.lock
 *.signature.png
 signatures/
 recent-files.json
+
+# AI Models (too large for git, download separately or use releases)
+public/models/
+*.onnx

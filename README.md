@@ -1,6 +1,6 @@
 # Viridian Leaf
 
-A free, open-source PDF viewer and editor for Windows.
+A free, open-source PDF viewer and editor for Windows and macOS.
 
 **No bloatware. No subscriptions. No ads. Just PDFs.**
 
@@ -12,16 +12,55 @@ Developed by **Viridian Intelligence Ltd. UK**
 
 ## Features
 
+### Core PDF Features
 - **PDF Viewer** - Fast rendering with smooth zoom and scroll
 - **Page Navigation** - Thumbnail sidebar, keyboard shortcuts, page jump
-- **Zoom Controls** - Fit to width, custom zoom levels (Ctrl+scroll)
-- **Annotations** - Highlights, text boxes, freehand drawing, signatures
-- **Redaction** - Black out sensitive information
-- **Export to Images** - PNG, JPEG export of any page
-- **PDF Merging** - Combine multiple PDFs into one
+- **Zoom Controls** - Fit to width, fit to page, custom zoom levels (Ctrl+scroll)
+- **Multi-Tab Support** - Open multiple PDFs in tabs
+- **View Modes** - Single page, two-page, or continuous scroll
+
+### Annotations & Editing
+- **Highlights** - Select text and highlight in multiple colors
+- **Text Boxes** - Add text annotations anywhere on the page
+- **Sticky Notes** - Add collapsible notes to pages
+- **Freehand Drawing** - Draw with customizable colors and widths
+- **Signatures** - Draw and save signatures for reuse
+- **Images** - Insert images onto PDF pages
+- **Links** - Add clickable link areas
+- **Redaction** - Black out sensitive information permanently
+
+### AI Assistant (NEW)
+- **Document Q&A** - Ask questions about your PDF content
+- **AI Summarization** - Get quick summaries of documents
+- **OpenAI Compatible** - Works with OpenAI, Azure OpenAI, or any compatible API
+- **Local AI Support** - Use Ollama for free, private AI (no cloud required)
+- **Non-blocking UI** - Continue viewing PDFs while AI processes
+
+### Export & Conversion (NEW)
+- **Export to Word (.docx)** - Convert PDFs to editable Word documents
+- **Export to PowerPoint (.pptx)** - Create presentations from PDF content
+- **Extract Tables to Excel (.xlsx)** - Pull tabular data into spreadsheets
+- **Export to Images** - PNG, JPEG export of any page or all pages
+- **Export to Text/RTF/HTML** - Extract text in multiple formats
+
+### Document Tools
+- **PDF Merging** - Combine multiple PDFs into one with drag-and-drop ordering
+- **Page Rotation** - Rotate individual pages or entire documents
+- **Page Reordering** - Rearrange pages within a PDF
+- **Page Deletion** - Remove unwanted pages
+- **Watermarks** - Add text watermarks with custom positioning
+- **Headers/Footers** - Add page numbers and custom text
+- **OCR** - Extract text from scanned PDFs using Tesseract.js
+- **Read Aloud** - Text-to-speech for document content
+
+### User Experience
 - **Dark Theme** - Modern, easy on the eyes interface
+- **Bookmarks** - Built-in PDF bookmarks + custom bookmarks
 - **File Association** - Double-click PDFs to open directly
-- **Lightweight** - ~10MB installer (vs 150MB+ for Electron apps)
+- **Remember Position** - Reopens PDFs where you left off
+- **Recent Files** - Quick access to recently opened documents
+- **Undo/Redo** - Full history for annotation changes
+- **Lightweight** - ~15MB installer (vs 150MB+ for Electron apps)
 - **Native Performance** - Rust backend, minimal resource usage
 
 ## Installation (Windows)
@@ -86,11 +125,34 @@ The installers will be created in `src-tauri/target/release/bundle/`:
 | Ctrl+O | Open PDF |
 | Ctrl+S | Save PDF |
 | Ctrl+E | Export to Image |
+| Ctrl+F | Find text |
+| Ctrl+Z | Undo |
+| Ctrl+Y | Redo |
 | Ctrl++ | Zoom In |
 | Ctrl+- | Zoom Out |
+| Ctrl+0 | Actual Size (100%) |
 | Left/Right | Previous/Next Page |
 | Home/End | First/Last Page |
+| F9 | Toggle Sidebar |
+| F11 | Full Screen |
 | Ctrl+Scroll | Zoom |
+
+## Setting Up AI (Optional)
+
+### Option 1: OpenAI API
+1. Go to **Document** > **AI Settings**
+2. Enter your OpenAI API key
+3. Set model to `gpt-4o-mini` or `gpt-4o`
+4. Click Save
+
+### Option 2: Ollama (Free, Local AI)
+1. Download [Ollama](https://ollama.ai) for your platform
+2. Run `ollama pull llama3.2` in terminal
+3. In Viridian Leaf, go to **Document** > **AI Settings**
+4. Enable "Use local AI (Ollama)"
+5. Click Save
+
+The AI panel appears on the right side when viewing a PDF.
 
 ## Tech Stack
 
@@ -98,7 +160,10 @@ The installers will be created in `src-tauri/target/release/bundle/`:
 - **Backend:** Rust + Tauri 2.0
 - **PDF Rendering:** PDF.js (Mozilla)
 - **PDF Editing:** pdf-lib
-- **Styling:** CSS (dark theme)
+- **AI:** OpenAI API / Ollama (local)
+- **Office Export:** docx, pptxgenjs, xlsx
+- **OCR:** Tesseract.js
+- **Styling:** CSS with dark/light themes
 
 ## License
 
