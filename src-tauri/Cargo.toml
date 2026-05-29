@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "A free, lightweight PDF viewer and editor"
 authors = ["Viridian Intelligence Ltd. UK"]
 license = "MIT"
-repository = "https://github.com/coffogit/Viridian-Leaf"
+repository = "https://github.com/Perspiqua/Viridian-Leaf"
 edition = "2021"
 
 [lib]

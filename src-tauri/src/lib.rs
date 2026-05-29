@@ -1,6 +1,6 @@
 // Viridian Leaf - A free PDF viewer and editor
 // Copyright (c) 2026 Viridian Intelligence Ltd. UK
-// https://github.com/coffogit/Viridian-Leaf
+// https://github.com/Perspiqua/Viridian-Leaf
 // Licensed under MIT License
 
 use serde::{Deserialize, Serialize};
